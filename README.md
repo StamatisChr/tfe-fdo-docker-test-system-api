@@ -37,13 +37,13 @@ Clone the repository to your computer.
 
 Open your cli and run:
 ```
-git clone git@github.com:StamatisChr/TFE-FDO-docker-test-system-api.git
+git clone git@github.com:StamatisChr/tfe-fdo-docker-test-system-api.git
 ```
 
 
 When the repository cloning is finished, change directory to the repo’s terraform directory:
 ```
-cd TFE-FDO-docker-test-system-api
+cd tfe-fdo-docker-test-system-api
 ```
 
 Here you need to create a `variables.auto.tfvars` file with your specifications. Use the example tfvars file.
