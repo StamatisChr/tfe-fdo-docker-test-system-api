@@ -1,0 +1,145 @@
+#cloud-config
+package_update: true
+groups:
+ - docker
+
+packages:
+  - ca-certificates
+  - curl
+
+write_files:
+  - path: /etc/terraform-enterprise/docker-compose.yml
+    permissions: '0644'
+    content: |
+      ---
+      name: "terraform-enterprise"
+      services:
+        tfe:
+          image: "images.releases.hashicorp.com/hashicorp/terraform-enterprise:${tfe_version_image}"
+          environment:
+            TFE_LICENSE: "${tfe_license}"
+            TFE_HOSTNAME: "${tfe_hostname}"
+            TFE_ENCRYPTION_PASSWORD: "${tfe_encryption_password}"
+            TFE_OPERATIONAL_MODE: "disk"
+            TFE_DISK_CACHE_VOLUME_NAME: "$${COMPOSE_PROJECT_NAME}_terraform-enterprise-cache"
+            TFE_TLS_CERT_FILE: "/etc/ssl/private/terraform-enterprise/${cert}"
+            TFE_TLS_KEY_FILE: "/etc/ssl/private/terraform-enterprise/${key}"
+            TFE_TLS_CA_BUNDLE_FILE: "/etc/ssl/private/terraform-enterprise/${bundle}"
+            TFE_HTTP_PORT: 80
+            TFE_HTTPS_PORT: 443
+            TFE_IACT_TOKEN: "${tfe_iact_token}"
+          cap_add:
+            - IPC_LOCK
+          read_only: true
+          tmpfs:
+            - /tmp:mode=01777
+            - /run
+            - /var/log/terraform-enterprise
+          ports:
+            - "80:80"
+            - "443:443"
+            - "8443:8443"
+          volumes:
+            - type: bind
+              source: /var/run/docker.sock
+              target: /run/docker.sock
+            - type: bind
+              source: "${tfe_host_path_to_certificates}"
+              target: /etc/ssl/private/terraform-enterprise
+            - type: bind
+              source: "${tfe_host_path_to_data}"
+              target: /var/lib/terraform-enterprise
+            - type: volume
+              source: terraform-enterprise-cache
+              target: /var/cache/tfe-task-worker/terraform
+      volumes:
+        terraform-enterprise-cache:
+  - path: /etc/systemd/system/terraform-enterprise.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Terraform Enterprise Service
+      Requires=docker.service
+      After=docker.service network.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      WorkingDirectory=/etc/terraform-enterprise
+      ExecStart=/usr/bin/docker compose up -d
+      ExecStop=/usr/bin/docker compose down
+      TimeoutStartSec=0
+      [Install]
+      WantedBy=multi-user.target
+# The json file to create the first admin user:
+  - path: ${tfe_host_path_to_scripts}/payload.json
+    permissions: '0644'
+    content: |
+      {
+      "username": "${admin_username}",
+      "email": "${admin_email}",
+      "password": "${admin_password}"
+      }
+  - path: ${tfe_host_path_to_scripts}/createorg.json
+    permissions: '0644'
+    content: |
+      {
+        "data": {
+          "type": "organizations",
+          "attributes": {
+            "name": "${tfe_org}",
+            "email": "${admin_email}"
+          }
+        }
+      }
+
+runcmd:
+# Install Docker
+  - apt-get update -y
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  - apt-get update -y
+  - apt-get -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - usermod -a -G docker ubuntu
+
+# Configure UFW for Docker
+  - ufw allow in on docker0
+  
+# Create necessary TFE directories
+  - mkdir -p ${tfe_host_path_to_certificates}
+  - mkdir -p ${tfe_host_path_to_data}
+  - mkdir -p ${tfe_host_path_to_scripts}
+# Spawn Certbot container to generate TLS certificates
+  - docker run --rm -p 80:80 -v ${tfe_host_path_to_certificates}:/etc/letsencrypt/archive/${tfe_hostname} certbot/certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email --preferred-challenges http -d ${tfe_hostname}
+# Log in to the Terraform Enterprise container image registry and pull the image
+  - echo "${tfe_license}" | docker login --username terraform images.releases.hashicorp.com --password-stdin
+  - docker pull images.releases.hashicorp.com/hashicorp/terraform-enterprise:${tfe_version_image}
+# Enable and start the Terraform Enterprise service
+  - systemctl enable --now terraform-enterprise  
+# Wait TFE to start  
+  - while [ "$(curl -fsS https://${tfe_hostname}/_health_check)" != "OK" ]; do echo "$(date +"%Y-%m-%d %H:%M:%S") Waiting TFE to start..."; sleep 20; done
+# Create the initial admin user and get his user api token  
+  - |
+   ADMIN_USER_API_TOKEN=$(curl --header "Content-Type: application/json" --request POST --data @${tfe_host_path_to_scripts}/payload.json "https://${tfe_hostname}/admin/initial-admin-user?token=${tfe_iact_token}"  | jq -r '.token' )
+# Generate admin api token 
+  - |
+   ADMIN_API_TOKEN=$(docker exec terraform-enterprise-tfe-1 tfectl admin api-token generate --description "system api example") 
+# Create a TFE organization 
+  - |
+   curl --header "Authorization: Bearer $ADMIN_USER_API_TOKEN" --header "Content-Type: application/vnd.api+json" --request POST --data @${tfe_host_path_to_scripts}/createorg.json "https://${tfe_hostname}/api/v2/organizations" 
+
+  - |
+   cat <<EOF > ${tfe_host_path_to_scripts}/createws.json
+    {
+      "data": {
+        "attributes": {
+          "name": "$ADMIN_API_TOKEN"
+        },
+        "type": "workspaces"
+      }
+    }
+   EOF
+
+  - |
+   curl --header "Authorization: Bearer $ADMIN_USER_API_TOKEN" --header "Content-Type: application/vnd.api+json" --request POST --data @${tfe_host_path_to_scripts}/createws.json "https://${tfe_hostname}/api/v2/organizations/${tfe_org}/workspaces"
